@@ -42,3 +42,7 @@ def get_history():
             FROM weather
             ORDER BY timestamp
         """).fetchall()
+
+def clear_history():
+    with connect() as db:
+        db.execute("DELETE FROM weather")

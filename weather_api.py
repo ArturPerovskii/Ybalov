@@ -1,18 +1,15 @@
+
 import requests
 
 API_URL = "https://api.open-meteo.com/v1/forecast"
 
-LATITUDE = 51.99
-LONGITUDE = 4.21
 
-
-def get_weather():
-
+def get_weather(latitude, longitude, timezone):
     params = {
-        "latitude": LATITUDE,
-        "longitude": LONGITUDE,
+        "latitude": latitude,
+        "longitude": longitude,
         "current": "pressure_msl,temperature_2m",
-        "timezone": "Europe/Amsterdam"
+        "timezone": timezone
     }
 
     response = requests.get(

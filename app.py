@@ -1,37 +1,158 @@
 
 import sys
+import json
+from pathlib import Path
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel,
-    QFrame
+    QPushButton, QDialog, QLineEdit,
+    QListWidget, QMessageBox
 )
 from PySide6.QtCore import QTimer, Qt
 
 import pyqtgraph as pg
+from pyqtgraph.graphicsItems.DateAxisItem import DateAxisItem
 
 import database
 import weather_api
+import location_service
+
+
+SETTINGS_FILE = Path(__file__).with_name("settings.json")
+
+
+def save_location(location):
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as file:
+        json.dump(location, file, ensure_ascii=False, indent=4)
+
+
+def load_location():
+    if not SETTINGS_FILE.exists():
+        return None
+
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as file:
+            location = json.load(file)
+
+        # Проверяем обязательные поля
+        required = ["name", "latitude", "longitude", "timezone"]
+
+        if all(key in location for key in required):
+            return location
+
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    return None
+
+
+class LocationDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.setWindowTitle("Выбор местоположения")
+        self.resize(450, 400)
+
+        self.selected_location = None
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("Введите название города:")
+        layout.addWidget(title)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Например, Paris")
+        self.search_input.returnPressed.connect(self.search)
+        layout.addWidget(self.search_input)
+
+        search_button = QPushButton("Найти город")
+        search_button.clicked.connect(self.search)
+        layout.addWidget(search_button)
+
+        self.results_list = QListWidget()
+        self.results_list.itemDoubleClicked.connect(
+            lambda item: self.choose()
+        )
+        layout.addWidget(self.results_list)
+
+        self.choose_button = QPushButton("Выбрать")
+        self.choose_button.clicked.connect(self.choose)
+        layout.addWidget(self.choose_button)
+
+        self.status_label = QLabel("")
+        layout.addWidget(self.status_label)
+
+    def search(self):
+        query = self.search_input.text().strip()
+
+        if not query:
+            return
+
+        self.results_list.clear()
+        self.status_label.setText("Поиск...")
+
+        try:
+            results = location_service.search_locations(query)
+
+            if not results:
+                self.status_label.setText("Город не найден.")
+                return
+
+            for location in results:
+                from PySide6.QtWidgets import QListWidgetItem
+
+                item = QListWidgetItem(location["name"])
+                item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    location
+                )
+                self.results_list.addItem(item)
+
+            self.status_label.setText(
+                f"Найдено вариантов: {len(results)}"
+            )
+
+        except Exception as error:
+            self.status_label.setText(
+                f"Ошибка поиска: {error}"
+            )
+
+    def choose(self):
+        item = self.results_list.currentItem()
+
+        if item is None:
+            self.status_label.setText(
+                "Сначала выберите город из списка."
+            )
+            return
+
+        self.selected_location = item.data(
+            Qt.ItemDataRole.UserRole
+        )
+
+        self.accept()
 
 
 class WeatherMonitor(QMainWindow):
-    def __init__(self):
+    def __init__(self, location):
         super().__init__()
 
+        self.location = location
+
         self.setWindowTitle("WeatherMonitor")
-        self.resize(950, 700)
+        self.resize(950, 750)
 
         database.initialize()
 
         self.setup_ui()
 
-        # Обновление погоды каждые 15 минут
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_weather)
         self.timer.start(15 * 60 * 1000)
 
-        # Сразу получаем погоду при запуске
         self.update_weather()
 
     def setup_ui(self):
@@ -41,18 +162,39 @@ class WeatherMonitor(QMainWindow):
         layout = QVBoxLayout(central)
         layout.setSpacing(15)
 
+        # Заголовок и местоположение
+        header = QHBoxLayout()
+
         title = QLabel("WEATHER MONITOR")
-        title.setStyleSheet("font-size: 24px; font-weight: bold;")
-        layout.addWidget(title)
+        title.setStyleSheet(
+            "font-size: 24px; font-weight: bold;"
+        )
+        header.addWidget(title)
+
+        header.addStretch()
+
+        self.location_label = QLabel(self.location["name"])
+        self.location_label.setStyleSheet(
+            "font-size: 15px; font-weight: bold;"
+        )
+        header.addWidget(self.location_label)
+
+        change_button = QPushButton("Сменить город")
+        change_button.clicked.connect(self.change_location)
+        header.addWidget(change_button)
+
+        layout.addLayout(header)
 
         # Карточки показателей
         cards = QHBoxLayout()
 
         self.pressure_label = QLabel("-- hPa")
         self.temperature_label = QLabel("-- °C")
-        self.status_label = QLabel("Ожидание данных...")
 
-        for label in (self.pressure_label, self.temperature_label):
+        for label in (
+            self.pressure_label,
+            self.temperature_label
+        ):
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label.setStyleSheet("""
                 font-size: 28px;
@@ -65,13 +207,25 @@ class WeatherMonitor(QMainWindow):
             cards.addWidget(label)
 
         layout.addLayout(cards)
+
+        self.status_label = QLabel("Ожидание данных...")
         layout.addWidget(self.status_label)
 
         # График давления
-        self.pressure_plot = pg.PlotWidget(title="Атмосферное давление")
-        self.pressure_plot.setLabel("left", "Давление", units="hPa")
+        self.pressure_plot = pg.PlotWidget(
+            title="Атмосферное давление",
+            axisItems={
+                "bottom": DateAxisItem(orientation="bottom")
+            }
+        )
+
+        self.pressure_plot.setLabel(
+            "left", "Давление", units="hPa"
+        )
         self.pressure_plot.setLabel("bottom", "Время")
-        self.pressure_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.pressure_plot.showGrid(
+            x=True, y=True, alpha=0.3
+        )
         self.pressure_plot.setMinimumHeight(230)
         layout.addWidget(self.pressure_plot)
 
@@ -82,10 +236,20 @@ class WeatherMonitor(QMainWindow):
         )
 
         # График температуры
-        self.temperature_plot = pg.PlotWidget(title="Температура воздуха")
-        self.temperature_plot.setLabel("left", "Температура", units="°C")
+        self.temperature_plot = pg.PlotWidget(
+            title="Температура воздуха",
+            axisItems={
+                "bottom": DateAxisItem(orientation="bottom")
+            }
+        )
+
+        self.temperature_plot.setLabel(
+            "left", "Температура", units="°C"
+        )
         self.temperature_plot.setLabel("bottom", "Время")
-        self.temperature_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.temperature_plot.showGrid(
+            x=True, y=True, alpha=0.3
+        )
         self.temperature_plot.setMinimumHeight(230)
         layout.addWidget(self.temperature_plot)
 
@@ -95,9 +259,68 @@ class WeatherMonitor(QMainWindow):
             symbolSize=5
         )
 
+    def change_location(self):
+        dialog = LocationDialog(self)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_location = dialog.selected_location
+
+        if new_location is None:
+            return
+
+        # Если выбран тот же город, ничего не меняем
+        if (
+            new_location["latitude"] == self.location["latitude"]
+            and new_location["longitude"] == self.location["longitude"]
+        ):
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Смена местоположения",
+            "При смене города вся накопленная история "
+            "погоды будет удалена.\n\n"
+            f"Новое местоположение: {new_location['name']}\n\n"
+            "Продолжить?",
+            QMessageBox.StandardButton.Yes |
+            QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        # Останавливаем обновление на время смены города
+        self.timer.stop()
+
+        database.clear_history()
+
+        self.location = new_location
+        save_location(self.location)
+
+        self.location_label.setText(self.location["name"])
+
+        self.pressure_curve.setData([], [])
+        self.temperature_curve.setData([], [])
+
+        self.pressure_label.setText("-- hPa")
+        self.temperature_label.setText("-- °C")
+
+        self.status_label.setText("Местоположение изменено.")
+
+        self.timer.start(15 * 60 * 1000)
+
+        self.update_weather()
+
     def update_weather(self):
         try:
-            weather = weather_api.get_weather()
+            weather = weather_api.get_weather(
+                self.location["latitude"],
+                self.location["longitude"],
+                self.location["timezone"]
+            )
 
             database.save_weather(
                 weather["timestamp"],
@@ -120,7 +343,9 @@ class WeatherMonitor(QMainWindow):
             self.update_graphs()
 
         except Exception as error:
-            self.status_label.setText(f"Ошибка получения данных: {error}")
+            self.status_label.setText(
+                f"Ошибка получения данных: {error}"
+            )
 
     def update_graphs(self):
         history = database.get_history()
@@ -128,7 +353,9 @@ class WeatherMonitor(QMainWindow):
         if not history:
             return
 
-        now = datetime.now()
+        timezone = ZoneInfo(self.location["timezone"])
+
+        now = datetime.now(timezone)
         cutoff = now - timedelta(days=1)
 
         timestamps = []
@@ -138,21 +365,47 @@ class WeatherMonitor(QMainWindow):
         for timestamp, pressure, temperature in history:
             dt = datetime.fromisoformat(timestamp)
 
-            if dt.replace(tzinfo=None) < cutoff:
+            # Open-Meteo возвращает местное время без UTC-смещения
+            dt = dt.replace(tzinfo=timezone)
+
+            if dt < cutoff:
                 continue
 
             timestamps.append(dt.timestamp())
             pressures.append(pressure)
             temperatures.append(temperature)
 
-        self.pressure_curve.setData(timestamps, pressures)
-        self.temperature_curve.setData(timestamps, temperatures)
+        self.pressure_curve.setData(
+            timestamps, pressures
+        )
+
+        self.temperature_curve.setData(
+            timestamps, temperatures
+        )
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    window = WeatherMonitor()
+    database.initialize()
+
+    location = load_location()
+
+    # При первом запуске обязательно выбираем город
+    if location is None:
+        dialog = LocationDialog()
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            sys.exit(0)
+
+        location = dialog.selected_location
+
+        if location is None:
+            sys.exit(0)
+
+        save_location(location)
+
+    window = WeatherMonitor(location)
     window.show()
 
     sys.exit(app.exec())
