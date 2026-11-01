@@ -1,4 +1,3 @@
-
 import sys
 import json
 from pathlib import Path
@@ -9,15 +8,16 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QDialog, QLineEdit,
-    QListWidget, QMessageBox
+    QListWidget, QListWidgetItem, QMessageBox
 )
-from PySide6.QtCore import QTimer, Qt
+
+from PySide6.QtCore import Qt
+from weather_worker import WeatherWorker
 
 import pyqtgraph as pg
 from pyqtgraph.graphicsItems.DateAxisItem import DateAxisItem
 
 import database
-import weather_api
 import location_service
 
 
@@ -102,8 +102,6 @@ class LocationDialog(QDialog):
                 return
 
             for location in results:
-                from PySide6.QtWidgets import QListWidgetItem
-
                 item = QListWidgetItem(location["name"])
                 item.setData(
                     Qt.ItemDataRole.UserRole,
@@ -149,11 +147,18 @@ class WeatherMonitor(QMainWindow):
 
         self.setup_ui()
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_weather)
-        self.timer.start(15 * 60 * 1000)
+        # Запускаем независимый фоновый сборщик
+        self.worker = WeatherWorker(self.location)
 
-        self.update_weather()
+        self.worker.weather_updated.connect(
+            self.on_weather_updated
+        )
+
+        self.worker.error_occurred.connect(
+            self.on_weather_error
+        )
+
+        self.worker.start()
 
     def setup_ui(self):
         central = QWidget()
@@ -292,60 +297,70 @@ class WeatherMonitor(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        # Останавливаем обновление на время смены города
-        self.timer.stop()
+        # Останавливаем сбор данных
+        self.worker.stop()
+        self.worker.wait()
 
+        # Удаляем старую историю
         database.clear_history()
 
+        # Сохраняем новое местоположение
         self.location = new_location
         save_location(self.location)
 
         self.location_label.setText(self.location["name"])
 
+        # Очищаем графики
         self.pressure_curve.setData([], [])
         self.temperature_curve.setData([], [])
 
+        # Сбрасываем показатели
         self.pressure_label.setText("-- hPa")
         self.temperature_label.setText("-- °C")
 
         self.status_label.setText("Местоположение изменено.")
 
-        self.timer.start(15 * 60 * 1000)
+        # Запускаем сборщик для нового местоположения
+        self.worker = WeatherWorker(self.location)
 
-        self.update_weather()
+        self.worker.weather_updated.connect(
+            self.on_weather_updated
+        )
 
-    def update_weather(self):
-        try:
-            weather = weather_api.get_weather(
-                self.location["latitude"],
-                self.location["longitude"],
-                self.location["timezone"]
-            )
+        self.worker.error_occurred.connect(
+            self.on_weather_error
+        )
 
-            database.save_weather(
-                weather["timestamp"],
-                weather["pressure"],
-                weather["temperature"]
-            )
+        self.worker.start()
 
-            self.pressure_label.setText(
-                f'{weather["pressure"]:.1f} hPa'
-            )
+    def closeEvent(self, event):
+        # Пока приложение закрывается полностью,
+        # поэтому останавливаем фоновый поток
+        if self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait()
 
-            self.temperature_label.setText(
-                f'{weather["temperature"]:.1f} °C'
-            )
+        event.accept()
 
-            self.status_label.setText(
-                f'Последнее обновление: {weather["timestamp"]}'
-            )
+    def on_weather_updated(self, weather):
+        self.pressure_label.setText(
+            f'{weather["pressure"]:.1f} hPa'
+        )
 
-            self.update_graphs()
+        self.temperature_label.setText(
+            f'{weather["temperature"]:.1f} °C'
+        )
 
-        except Exception as error:
-            self.status_label.setText(
-                f"Ошибка получения данных: {error}"
-            )
+        self.status_label.setText(
+            f'Последнее обновление: {weather["timestamp"]}'
+        )
+
+        self.update_graphs()
+
+    def on_weather_error(self, error):
+        self.status_label.setText(
+            f"Ошибка получения данных: {error}"
+        )
 
     def update_graphs(self):
         history = database.get_history()
