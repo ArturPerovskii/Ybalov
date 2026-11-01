@@ -1,6 +1,8 @@
-import sqlite3
 
-DB_NAME = "weather.db"
+import sqlite3
+from pathlib import Path
+
+DB_NAME = Path(__file__).with_name("weather.db")
 
 
 def connect():
@@ -35,6 +37,38 @@ def save_weather(timestamp, pressure, temperature):
         """, (timestamp, pressure, temperature))
 
 
+def save_weather_batch(records):
+    """
+    Сохраняет список измерений из облачной базы.
+    Существующие записи обновляются, дубликаты не создаются.
+    """
+
+    values = [
+        (
+            item["timestamp"],
+            item["pressure"],
+            item["temperature"]
+        )
+        for item in records
+    ]
+
+    if not values:
+        return
+
+    with connect() as db:
+        db.executemany("""
+            INSERT INTO weather (
+                timestamp,
+                pressure,
+                temperature
+            )
+            VALUES (?, ?, ?)
+            ON CONFLICT(timestamp) DO UPDATE SET
+                pressure = excluded.pressure,
+                temperature = excluded.temperature
+        """, values)
+
+
 def get_history():
     with connect() as db:
         return db.execute("""
@@ -42,6 +76,7 @@ def get_history():
             FROM weather
             ORDER BY timestamp
         """).fetchall()
+
 
 def clear_history():
     with connect() as db:
